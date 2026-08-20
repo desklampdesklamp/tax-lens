@@ -1,323 +1,374 @@
-"""Transparent 2025 U.S. tax-estimation helpers used by the Streamlit UI."""
+"""Core calculations for the Tax Lens educational estimator.
+
+The functions in this module deliberately favor clear, inspectable estimates over
+filing-grade completeness.  They model 2025 federal income tax, employee payroll
+tax, and a clearly labeled state-income-tax proxy.
+"""
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass, replace
+from typing import Dict, Iterable, List, Tuple
+
 
 TAX_YEAR = 2025
-CHILD_TAX_CREDIT = 2_200
-SOCIAL_SECURITY_WAGE_BASE = 176_100
-RETIREMENT_LIMIT = 23_500
-HSA_LIMITS = {"Self-only HDHP": 4_300, "Family HDHP": 8_550}
 
-BRACKETS = {
-    "Single": [(11925, .10), (48475, .12), (103350, .22), (197300, .24), (250525, .32), (626350, .35), (float("inf"), .37)],
-    "Married filing jointly": [(23850, .10), (96950, .12), (206700, .22), (394600, .24), (501050, .32), (751600, .35), (float("inf"), .37)],
-    "Head of household": [(17000, .10), (64850, .12), (103350, .22), (197300, .24), (250500, .32), (626350, .35), (float("inf"), .37)],
-    "Married filing separately": [(11925, .10), (48475, .12), (103350, .22), (197300, .24), (250525, .32), (375800, .35), (float("inf"), .37)],
+
+FILING_LABELS: Dict[str, str] = {
+    "single": "Single",
+    "married_joint": "Married filing jointly",
+    "married_separate": "Married filing separately",
+    "head_household": "Head of household",
+}
+
+
+# 2025 ordinary-income brackets. Source: IRS Rev. Proc. 2024-40.
+FEDERAL_BRACKETS: Dict[str, List[Tuple[float, float]]] = {
+    "single": [
+        (11_925, 0.10),
+        (48_475, 0.12),
+        (103_350, 0.22),
+        (197_300, 0.24),
+        (250_525, 0.32),
+        (626_350, 0.35),
+        (float("inf"), 0.37),
+    ],
+    "married_joint": [
+        (23_850, 0.10),
+        (96_950, 0.12),
+        (206_700, 0.22),
+        (394_600, 0.24),
+        (501_050, 0.32),
+        (751_600, 0.35),
+        (float("inf"), 0.37),
+    ],
+    "married_separate": [
+        (11_925, 0.10),
+        (48_475, 0.12),
+        (103_350, 0.22),
+        (197_300, 0.24),
+        (250_525, 0.32),
+        (375_800, 0.35),
+        (float("inf"), 0.37),
+    ],
+    "head_household": [
+        (17_000, 0.10),
+        (64_850, 0.12),
+        (103_350, 0.22),
+        (197_300, 0.24),
+        (250_500, 0.32),
+        (626_350, 0.35),
+        (float("inf"), 0.37),
+    ],
 }
 
 STANDARD_DEDUCTION = {
-    "Single": 15_000,
-    "Married filing jointly": 30_000,
-    "Head of household": 22_500,
-    "Married filing separately": 15_000,
+    "single": 15_000.0,
+    "married_joint": 30_000.0,
+    "married_separate": 15_000.0,
+    "head_household": 22_500.0,
 }
 
-# This is a coarse educational profile, not a state tax engine. Rates approximate
-# a typical effective burden on taxable wages; the UI shows that caveat.
-NO_WAGE_TAX = {"Alaska", "Florida", "Nevada", "New Hampshire", "South Dakota", "Tennessee", "Texas", "Washington", "Wyoming"}
-LOW = {"Arizona", "Colorado", "Indiana", "Kentucky", "Louisiana", "Michigan", "Mississippi", "North Carolina", "North Dakota", "Ohio", "Pennsylvania", "Utah"}
-HIGH = {"California", "Connecticut", "District of Columbia", "Hawaii", "Maine", "Minnesota", "New Jersey", "New York", "Oregon", "Vermont"}
-STATES = [
-    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", "Delaware", "District of Columbia", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota", "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming",
-]
-STATE_PROFILES = {s: (0 if s in NO_WAGE_TAX else .035 if s in LOW else .06 if s in HIGH else .045) for s in STATES}
-
-# Approximate FY2024 shares of $6.75T total outlays, assembled from CBO's FY2024
-# summary. Categories are intentionally broad and sum to 100%.
-SPENDING_SHARES = {
-    "Social Security": .2145,
-    "Medicare": .1289,
-    "Medicaid & health programs": .1190,
-    "Defense": .1290,
-    "Income security": .0860,
-    "Net interest": .1300,
-    "Veterans": .0480,
-    "Transportation & infrastructure": .0300,
-    "Education & training": .0250,
-    "Other federal programs": .0896,
+ADDITIONAL_MEDICARE_THRESHOLD = {
+    "single": 200_000.0,
+    "married_joint": 250_000.0,
+    "married_separate": 125_000.0,
+    "head_household": 200_000.0,
 }
 
-# FY2024 agency-level proxy shares. Benefit payments and interest are grouped
-# under their administering entity, then normalized to 100%.
-AGENCY_SHARES = {
-    "Health & Human Services": .250,
-    "Social Security Administration": .215,
-    "Treasury (including net interest)": .140,
-    "Department of Defense": .130,
-    "Veterans Affairs": .050,
-    "Agriculture": .040,
-    "Education": .039,
-    "Transportation": .025,
-    "Homeland Security": .017,
-    "Justice": .007,
-    "NASA": .004,
-    "Environmental Protection Agency": .002,
-    "All other agencies": .081,
+# These are deliberately rough effective-rate proxies for wage income. They are
+# not filing calculations, do not include local taxes, and should not be used to
+# prepare a return.
+STATE_PROXY_RATES: Dict[str, float] = {
+    "Alabama": 0.038,
+    "Alaska": 0.0,
+    "Arizona": 0.035,
+    "Arkansas": 0.040,
+    "California": 0.065,
+    "Colorado": 0.044,
+    "Connecticut": 0.050,
+    "Delaware": 0.050,
+    "District of Columbia": 0.060,
+    "Florida": 0.0,
+    "Georgia": 0.046,
+    "Hawaii": 0.060,
+    "Idaho": 0.050,
+    "Illinois": 0.045,
+    "Indiana": 0.030,
+    "Iowa": 0.040,
+    "Kansas": 0.045,
+    "Kentucky": 0.040,
+    "Louisiana": 0.035,
+    "Maine": 0.055,
+    "Maryland": 0.055,
+    "Massachusetts": 0.050,
+    "Michigan": 0.040,
+    "Minnesota": 0.060,
+    "Mississippi": 0.040,
+    "Missouri": 0.040,
+    "Montana": 0.050,
+    "Nebraska": 0.045,
+    "Nevada": 0.0,
+    "New Hampshire": 0.0,
+    "New Jersey": 0.055,
+    "New Mexico": 0.040,
+    "New York": 0.060,
+    "North Carolina": 0.042,
+    "North Dakota": 0.020,
+    "Ohio": 0.030,
+    "Oklahoma": 0.040,
+    "Oregon": 0.070,
+    "Pennsylvania": 0.031,
+    "Rhode Island": 0.045,
+    "South Carolina": 0.050,
+    "South Dakota": 0.0,
+    "Tennessee": 0.0,
+    "Texas": 0.0,
+    "Utah": 0.045,
+    "Vermont": 0.060,
+    "Virginia": 0.047,
+    "Washington": 0.0,
+    "West Virginia": 0.045,
+    "Wisconsin": 0.050,
+    "Wyoming": 0.0,
 }
 
 
-def progressive_tax(taxable: float, brackets: list[tuple[float, float]]) -> tuple[float, float]:
-    tax = 0.0
+@dataclass(frozen=True)
+class TaxProfile:
+    """Inputs used by the estimator.
+
+    Salary is assumed to be W-2 wages. Other income is included for income-tax
+    purposes but not payroll-tax purposes.
+    """
+
+    salary: float = 75_000.0
+    other_income: float = 0.0
+    filing_status: str = "single"
+    dependents: int = 0
+    state: str = "California"
+    retirement_contributions: float = 0.0
+    hsa_contributions: float = 0.0
+    other_pretax: float = 0.0
+    itemized_deductions: float = 0.0
+    withholding_ytd: float = 0.0
+    pay_periods_completed: int = 0
+    pay_periods_per_year: int = 26
+
+    def cleaned(self) -> "TaxProfile":
+        """Return non-negative and internally safe inputs."""
+
+        return replace(
+            self,
+            salary=max(0.0, float(self.salary)),
+            other_income=max(0.0, float(self.other_income)),
+            dependents=max(0, int(self.dependents)),
+            retirement_contributions=max(0.0, float(self.retirement_contributions)),
+            hsa_contributions=max(0.0, float(self.hsa_contributions)),
+            other_pretax=max(0.0, float(self.other_pretax)),
+            itemized_deductions=max(0.0, float(self.itemized_deductions)),
+            withholding_ytd=max(0.0, float(self.withholding_ytd)),
+            pay_periods_completed=max(0, int(self.pay_periods_completed)),
+            pay_periods_per_year=max(1, int(self.pay_periods_per_year)),
+        )
+
+
+@dataclass(frozen=True)
+class TaxResult:
+    gross_income: float
+    pretax_contributions: float
+    adjusted_income: float
+    deduction: float
+    deduction_type: str
+    taxable_income: float
+    federal_before_credits: float
+    child_tax_credit: float
+    federal_income_tax: float
+    social_security_tax: float
+    medicare_tax: float
+    additional_medicare_tax: float
+    payroll_tax: float
+    state_income_tax_proxy: float
+    total_estimated_tax: float
+    take_home_after_estimated_tax: float
+    effective_federal_rate: float
+    effective_total_rate: float
+    marginal_federal_rate: float
+    bracket_rows: Tuple[Dict[str, float], ...]
+    projected_withholding: float | None
+    projected_refund_or_amount_due: float | None
+
+    def as_dict(self) -> Dict[str, float | str | None]:
+        return asdict(self)
+
+
+def progressive_tax(income: float, brackets: Iterable[Tuple[float, float]]) -> Tuple[float, Tuple[Dict[str, float], ...]]:
+    """Compute progressive tax and a transparent bracket-by-bracket audit trail."""
+
+    remaining = max(0.0, income)
     lower = 0.0
-    marginal = 0.0
+    total = 0.0
+    rows: List[Dict[str, float]] = []
     for upper, rate in brackets:
-        if taxable > lower:
-            tax += (min(taxable, upper) - lower) * rate
-            marginal = rate
-        if taxable <= upper:
+        width = max(0.0, upper - lower)
+        amount = min(remaining, width)
+        tax = amount * rate
+        if amount > 0 or upper == float("inf"):
+            rows.append(
+                {
+                    "lower": lower,
+                    "upper": upper,
+                    "rate": rate,
+                    "income_in_bracket": amount,
+                    "tax": tax,
+                }
+            )
+        total += tax
+        remaining -= amount
+        if remaining <= 0:
             break
         lower = upper
-    return tax, marginal
+    return total, tuple(rows)
 
 
-def calculate_estimate(
-    filing_status: str,
-    wages: float,
-    other_income: float,
-    pretax_contributions: float,
-    itemized_deductions: float,
-    qualifying_children: int,
-    state: str,
-    federal_withholding: float = 0,
-) -> dict[str, float | str]:
-    """Return a simplified federal, employee-payroll, and state estimate."""
-    gross = max(0, wages + other_income)
-    pretax = min(max(0, pretax_contributions), gross)
-    deduction = max(STANDARD_DEDUCTION[filing_status], max(0, itemized_deductions))
-    taxable = max(0, gross - pretax - deduction)
-    federal_precredit, marginal = progressive_tax(taxable, BRACKETS[filing_status])
+def marginal_rate(taxable_income: float, filing_status: str) -> float:
+    for upper, rate in FEDERAL_BRACKETS[filing_status]:
+        if taxable_income <= upper:
+            return rate
+    return FEDERAL_BRACKETS[filing_status][-1][1]
 
-    phaseout_start = 400_000 if filing_status == "Married filing jointly" else 200_000
-    phaseout = max(0, ((max(0, gross - phaseout_start) + 999) // 1_000) * 50)
-    eligible_credit = max(0, qualifying_children * CHILD_TAX_CREDIT - phaseout)
-    child_credit = min(federal_precredit, eligible_credit)  # nonrefundable portion only
-    federal = max(0, federal_precredit - child_credit)
 
-    ss = min(max(0, wages), SOCIAL_SECURITY_WAGE_BASE) * .062
-    medicare = max(0, wages) * .0145
-    addl_threshold = 250_000 if filing_status == "Married filing jointly" else 125_000 if filing_status == "Married filing separately" else 200_000
-    medicare += max(0, wages - addl_threshold) * .009
+def child_tax_credit(profile: TaxProfile, adjusted_income: float, federal_before_credits: float) -> float:
+    """A limited, non-refundable educational approximation of the 2025 CTC."""
 
-    state_base = max(0, gross - pretax - STANDARD_DEDUCTION[filing_status] * .55)
-    state_tax = state_base * STATE_PROFILES[state]
-    total = federal + ss + medicare + state_tax
-    withholding = max(0, federal_withholding)
+    if profile.dependents <= 0:
+        return 0.0
+    phaseout_start = 400_000.0 if profile.filing_status == "married_joint" else 200_000.0
+    potential_credit = 2_000.0 * profile.dependents
+    phaseout_steps = max(0, int((adjusted_income - phaseout_start + 999) // 1_000))
+    phaseout = 50.0 * phaseout_steps
+    return max(0.0, min(federal_before_credits, potential_credit - phaseout))
+
+
+def estimate_tax(profile: TaxProfile) -> TaxResult:
+    """Estimate tax components for a profile using the documented simplified rules."""
+
+    profile = profile.cleaned()
+    if profile.filing_status not in FILING_LABELS:
+        raise ValueError(f"Unsupported filing status: {profile.filing_status}")
+
+    gross_income = profile.salary + profile.other_income
+    pretax = min(
+        gross_income,
+        profile.retirement_contributions + profile.hsa_contributions + profile.other_pretax,
+    )
+    adjusted_income = max(0.0, gross_income - pretax)
+    standard = STANDARD_DEDUCTION[profile.filing_status]
+    deduction = max(standard, profile.itemized_deductions)
+    deduction_type = "Itemized" if profile.itemized_deductions > standard else "Standard"
+    taxable_income = max(0.0, adjusted_income - deduction)
+    federal_before_credits, bracket_rows = progressive_tax(
+        taxable_income, FEDERAL_BRACKETS[profile.filing_status]
+    )
+    ctc = child_tax_credit(profile, adjusted_income, federal_before_credits)
+    federal_income_tax = max(0.0, federal_before_credits - ctc)
+
+    # Traditional 401(k) deferrals generally do not reduce Social Security and
+    # Medicare wages, so this simplified estimator starts payroll tax from wages.
+    social_security_tax = min(profile.salary, 176_100.0) * 0.062
+    medicare_tax = profile.salary * 0.0145
+    additional_medicare_tax = max(
+        0.0, profile.salary - ADDITIONAL_MEDICARE_THRESHOLD[profile.filing_status],
+    ) * 0.009
+    payroll_tax = social_security_tax + medicare_tax + additional_medicare_tax
+
+    state_rate = STATE_PROXY_RATES.get(profile.state, 0.04)
+    # A transparent wage-income proxy: state taxable base is not an attempt to
+    # recreate each state's deductions, credits, or local tax rules.
+    state_taxable_proxy = max(0.0, adjusted_income - 12_000.0)
+    state_income_tax_proxy = state_taxable_proxy * state_rate
+
+    total = federal_income_tax + payroll_tax + state_income_tax_proxy
+    projected_withholding = None
+    refund_or_due = None
+    if profile.withholding_ytd > 0 and profile.pay_periods_completed > 0:
+        projected_withholding = (
+            profile.withholding_ytd
+            / profile.pay_periods_completed
+            * profile.pay_periods_per_year
+        )
+        refund_or_due = projected_withholding - total
+
+    return TaxResult(
+        gross_income=gross_income,
+        pretax_contributions=pretax,
+        adjusted_income=adjusted_income,
+        deduction=deduction,
+        deduction_type=deduction_type,
+        taxable_income=taxable_income,
+        federal_before_credits=federal_before_credits,
+        child_tax_credit=ctc,
+        federal_income_tax=federal_income_tax,
+        social_security_tax=social_security_tax,
+        medicare_tax=medicare_tax,
+        additional_medicare_tax=additional_medicare_tax,
+        payroll_tax=payroll_tax,
+        state_income_tax_proxy=state_income_tax_proxy,
+        total_estimated_tax=total,
+        take_home_after_estimated_tax=max(0.0, gross_income - pretax - total),
+        effective_federal_rate=(federal_income_tax / gross_income if gross_income else 0.0),
+        effective_total_rate=(total / gross_income if gross_income else 0.0),
+        marginal_federal_rate=marginal_rate(taxable_income, profile.filing_status),
+        bracket_rows=bracket_rows,
+        projected_withholding=projected_withholding,
+        projected_refund_or_amount_due=refund_or_due,
+    )
+
+
+def estimate_marginal_dollar(profile: TaxProfile, additional_income: float = 1_000.0) -> Dict[str, float]:
+    """Show the estimated tax impact of additional W-2 wages."""
+
+    additional_income = max(0.0, additional_income)
+    baseline = estimate_tax(profile)
+    comparison = estimate_tax(replace(profile, salary=profile.salary + additional_income))
+    total_change = comparison.total_estimated_tax - baseline.total_estimated_tax
     return {
-        "gross_income": gross,
-        "pretax_contributions": pretax,
-        "standard_deduction": STANDARD_DEDUCTION[filing_status],
-        "deduction_used": deduction,
-        "taxable_income": taxable,
-        "federal_before_credits": federal_precredit,
-        "child_credit_used": child_credit,
-        "federal_income_tax": federal,
-        "social_security": ss,
-        "medicare": medicare,
-        "state_income_tax": state_tax,
-        "total_tax": total,
-        "take_home": max(0, gross - pretax - total),
-        "effective_rate": total / gross if gross else 0,
-        "federal_effective_rate": federal / gross if gross else 0,
-        "marginal_rate": marginal,
-        "federal_withholding": withholding,
-        "refund_or_due": withholding - federal,
-        "state_note": "no broad wage tax" if state in NO_WAGE_TAX else "rough effective-rate proxy",
+        "additional_income": additional_income,
+        "federal_income_tax": comparison.federal_income_tax - baseline.federal_income_tax,
+        "payroll_tax": comparison.payroll_tax - baseline.payroll_tax,
+        "state_income_tax_proxy": comparison.state_income_tax_proxy - baseline.state_income_tax_proxy,
+        "total_tax": total_change,
+        "take_home": additional_income - total_change,
     }
 
 
-def project_withholding(
-    federal_tax: float,
-    withheld_year_to_date: float,
-    paychecks_remaining: int,
-    withholding_per_future_paycheck: float,
-) -> dict[str, float | str]:
-    """Project year-end federal withholding and a per-paycheck course correction."""
-    ytd = max(0, withheld_year_to_date)
-    remaining = max(0, int(paychecks_remaining))
-    current_per_check = max(0, withholding_per_future_paycheck)
-    projected_future = remaining * current_per_check
-    projected_total = ytd + projected_future
-    balance = projected_total - max(0, federal_tax)
-    target_per_check = max(0, (max(0, federal_tax) - ytd) / remaining) if remaining else 0
-    adjustment = target_per_check - current_per_check if remaining else 0
-    status = "refund" if balance > 1 else "amount due" if balance < -1 else "near zero"
-    return {
-        "withheld_year_to_date": ytd,
-        "projected_future_withholding": projected_future,
-        "projected_total_withholding": projected_total,
-        "projected_balance": balance,
-        "target_per_paycheck": target_per_check,
-        "per_paycheck_adjustment": adjustment,
-        "status": status,
-    }
+def scenario_profile(profile: TaxProfile, scenario: str, comparison_state: str | None = None) -> TaxProfile:
+    """Return a transparent preset scenario for side-by-side comparison."""
+
+    if scenario == "Earn $10,000 more":
+        return replace(profile, salary=profile.salary + 10_000.0)
+    if scenario == "Contribute $5,000 more to retirement":
+        return replace(profile, retirement_contributions=profile.retirement_contributions + 5_000.0)
+    if scenario == "Add one dependent":
+        return replace(profile, dependents=profile.dependents + 1)
+    if scenario == "Move to comparison state":
+        return replace(profile, state=comparison_state or profile.state)
+    return profile
 
 
-def incremental_tax_breakdown(base_inputs: dict, extra_wages: float) -> dict[str, float]:
-    """Show what happens to an additional amount of wage income."""
-    base = calculate_estimate(**base_inputs)
-    changed_inputs = dict(base_inputs)
-    changed_inputs["wages"] = max(0, changed_inputs["wages"] + max(0, extra_wages))
-    changed = calculate_estimate(**changed_inputs)
-    federal = changed["federal_income_tax"] - base["federal_income_tax"]
-    social_security = changed["social_security"] - base["social_security"]
-    medicare = changed["medicare"] - base["medicare"]
-    state = changed["state_income_tax"] - base["state_income_tax"]
-    kept = changed["take_home"] - base["take_home"]
-    return {
-        "extra_wages": max(0, extra_wages),
-        "federal_income_tax": federal,
-        "social_security": social_security,
-        "medicare": medicare,
-        "state_income_tax": state,
-        "kept": kept,
-        "combined_incremental_rate": 1 - kept / extra_wages if extra_wages else 0,
-    }
+def state_comparison(profile: TaxProfile, states: Iterable[str]) -> List[Dict[str, float | str]]:
+    """Compare the same profile under the app's state income-tax proxies."""
 
+    rows = []
+    for state in states:
+        result = estimate_tax(replace(profile, state=state))
+        rows.append(
+            {
+                "state": state,
+                "state_proxy_rate": STATE_PROXY_RATES.get(state, 0.04),
+                "state_income_tax_proxy": result.state_income_tax_proxy,
+                "estimated_take_home": result.take_home_after_estimated_tax,
+            }
+        )
+    return sorted(rows, key=lambda row: float(row["estimated_take_home"]), reverse=True)
 
-def student_loan_interest_deduction(filing_status: str, gross_income: float, interest_paid: float) -> float:
-    """Simplified 2025 student-loan-interest deduction and income phaseout."""
-    if filing_status == "Married filing separately":
-        return 0
-    amount = min(2_500, max(0, interest_paid))
-    lower, upper = ((170_000, 200_000) if filing_status == "Married filing jointly" else (85_000, 100_000))
-    if gross_income <= lower:
-        return amount
-    if gross_income >= upper:
-        return 0
-    return amount * (upper - gross_income) / (upper - lower)
-
-
-def _education_credit(filing_status: str, gross_income: float, education_expenses: float) -> float:
-    if filing_status == "Married filing separately" or education_expenses <= 0:
-        return 0
-    tentative = min(2_000, education_expenses) + min(2_000, max(0, education_expenses - 2_000)) * .25
-    lower, upper = ((160_000, 180_000) if filing_status == "Married filing jointly" else (80_000, 90_000))
-    if gross_income <= lower:
-        return tentative
-    if gross_income >= upper:
-        return 0
-    return tentative * (upper - gross_income) / (upper - lower)
-
-
-def _dependent_care_credit(gross_income: float, qualifying_people: int, expenses: float) -> float:
-    if qualifying_people <= 0 or expenses <= 0:
-        return 0
-    eligible_expenses = min(expenses, 3_000 if qualifying_people == 1 else 6_000)
-    # The statutory rate slides from 35% to a 20% floor as AGI rises.
-    reductions = max(0, int((gross_income - 15_000 + 1_999) // 2_000))
-    rate = max(.20, .35 - reductions * .01)
-    return eligible_expenses * rate
-
-
-def opportunity_screen(
-    *,
-    filing_status: str,
-    gross_income: float,
-    earned_income: float,
-    marginal_rate: float,
-    qualifying_children: int,
-    age: int,
-    retirement_contributions: float,
-    hsa_coverage: str,
-    hsa_contributions: float,
-    dependent_care_expenses: float,
-    education_expenses: float,
-    student_loan_interest: float,
-) -> list[dict[str, float | str]]:
-    """Return personalized leads, not determinations of eligibility."""
-    items: list[dict[str, float | str]] = []
-
-    catch_up = 11_250 if 60 <= age <= 63 else 7_500 if age >= 50 else 0
-    retirement_room = max(0, RETIREMENT_LIMIT + catch_up - max(0, retirement_contributions))
-    if earned_income > 0 and retirement_room > 0:
-        example_contribution = min(retirement_room, 5_000, max(0, earned_income - retirement_contributions))
-        items.append({
-            "title": "Workplace retirement contribution",
-            "estimate": example_contribution * marginal_rate,
-            "detail": f"You appear to have about ${retirement_room:,.0f} of room under the simplified 2025 employee limit. A ${example_contribution:,.0f} additional pre-tax contribution could reduce federal income tax by roughly ${example_contribution * marginal_rate:,.0f} at your current marginal rate.",
-            "next_step": "Check plan eligibility, employer matching, and payroll deadlines.",
-        })
-
-    if hsa_coverage in HSA_LIMITS:
-        hsa_limit = HSA_LIMITS[hsa_coverage] + (1_000 if age >= 55 else 0)
-        hsa_room = max(0, hsa_limit - max(0, hsa_contributions))
-        if hsa_room > 0:
-            items.append({
-                "title": "Health Savings Account",
-                "estimate": hsa_room * marginal_rate,
-                "detail": f"Your selected coverage suggests up to ${hsa_room:,.0f} of remaining 2025 HSA room. If fully deductible, that amount could reduce federal income tax by roughly ${hsa_room * marginal_rate:,.0f}.",
-                "next_step": "Confirm HDHP eligibility, coverage dates, employer deposits, and Medicare status.",
-            })
-
-    care_credit = _dependent_care_credit(gross_income, qualifying_children, dependent_care_expenses)
-    if care_credit > 0:
-        items.append({
-            "title": "Child and dependent care credit",
-            "estimate": care_credit,
-            "detail": f"The expenses entered produce a rough nonrefundable credit screen of ${care_credit:,.0f}. Work-related care, provider, earned-income, and qualifying-person tests apply.",
-            "next_step": "Review Form 2441 requirements and any dependent-care FSA benefits.",
-        })
-
-    education_credit = _education_credit(filing_status, gross_income, education_expenses)
-    if education_expenses > 0:
-        items.append({
-            "title": "Education credit",
-            "estimate": education_credit,
-            "detail": f"The expenses entered produce an American Opportunity Credit screen of about ${education_credit:,.0f}; the Lifetime Learning Credit may be a better fit in some cases. The same expenses cannot support multiple benefits.",
-            "next_step": "Confirm student eligibility, Form 1098-T amounts, scholarships, and income limits.",
-        })
-
-    loan_deduction = student_loan_interest_deduction(filing_status, gross_income, student_loan_interest)
-    if student_loan_interest > 0:
-        items.append({
-            "title": "Student-loan interest deduction",
-            "estimate": loan_deduction * marginal_rate,
-            "detail": f"About ${loan_deduction:,.0f} of the interest entered may survive the simplified income phaseout, with an illustrative federal tax effect of ${loan_deduction * marginal_rate:,.0f}.",
-            "next_step": "Check Form 1098-E, legal obligation, dependency status, and loan eligibility.",
-        })
-
-    savers_limit = 79_000 if filing_status == "Married filing jointly" else 59_250 if filing_status == "Head of household" else 39_500
-    if 0 < retirement_contributions and gross_income <= savers_limit and age >= 18:
-        max_credit = 2_000 if filing_status == "Married filing jointly" else 1_000
-        items.append({
-            "title": "Saver's Credit screening flag",
-            "estimate": max_credit,
-            "detail": f"Your income is below the broad 2025 ${savers_limit:,.0f} screen. The actual credit is 10%, 20%, or 50% of eligible contributions and may be lower than the maximum shown.",
-            "next_step": "Confirm that you are not a dependent or full-time student and review Form 8880.",
-        })
-
-    eitc_max = {0: 649, 1: 4_328, 2: 7_152}.get(min(qualifying_children, 3), 8_046)
-    broad_eitc_limit = 68_675 if filing_status == "Married filing jointly" else 61_555
-    if 0 < earned_income <= broad_eitc_limit:
-        items.append({
-            "title": "Earned Income Tax Credit eligibility check",
-            "estimate": eitc_max,
-            "detail": f"Your earned income is within a broad screening range. The amount shown is the 2025 maximum for the child count entered, not an estimate of your credit.",
-            "next_step": "Use the IRS EITC Assistant; age, residency, investment-income, SSN, and qualifying-child rules matter.",
-        })
-
-    return items
-
-
-def allocate_federal_income_tax(amount: float) -> list[tuple[str, float]]:
-    return [(category, amount * share) for category, share in SPENDING_SHARES.items()]
-
-
-def allocate_by_agency(amount: float) -> list[tuple[str, float]]:
-    return [(agency, amount * share) for agency, share in AGENCY_SHARES.items()]
-
-
-def ukraine_scale_estimate(federal_income_tax: float) -> float:
-    # $174.2B appropriated, compared with roughly $19.15T FY22-FY24 outlays.
-    return federal_income_tax * 174.2 / 19_150

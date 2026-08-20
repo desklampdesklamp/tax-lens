@@ -1,91 +1,150 @@
-"""Build a compact, anonymous PDF tax receipt for Tax Lens."""
+"""A compact one-page PDF tax-receipt generator."""
 
 from __future__ import annotations
 
 from io import BytesIO
+from typing import Iterable, Mapping
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfgen import canvas
 
-from tax_engine import allocate_by_agency, allocate_federal_income_tax
+from tax_engine import FILING_LABELS, TaxProfile, TaxResult
 
 
 def _money(value: float) -> str:
     return f"${value:,.0f}"
 
 
-def build_tax_receipt(result: dict, filing_status: str, state: str) -> bytes:
-    """Return a one-to-two-page PDF containing no direct identifiers."""
+def _truncate(text: str, max_width: float, font: str, size: float) -> str:
+    if stringWidth(text, font, size) <= max_width:
+        return text
+    ellipsis = "..."
+    while text and stringWidth(text + ellipsis, font, size) > max_width:
+        text = text[:-1]
+    return text + ellipsis
+
+
+def build_tax_receipt(
+    profile: TaxProfile,
+    result: TaxResult,
+    allocations: Iterable[Mapping[str, object]],
+) -> bytes:
+    """Create an educational one-page receipt as PDF bytes."""
+
     buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=letter,
-        rightMargin=.52 * inch,
-        leftMargin=.52 * inch,
-        topMargin=.38 * inch,
-        bottomMargin=.38 * inch,
-        title="Tax Lens 2025 Estimate",
-        author="Tax Lens",
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    margin = 44
+    cursor = height - 46
+
+    pdf.setFillColor(colors.HexColor("#113B5C"))
+    pdf.rect(0, height - 84, width, 84, fill=1, stroke=0)
+    pdf.setFillColor(colors.white)
+    pdf.setFont("Helvetica-Bold", 20)
+    pdf.drawString(margin, height - 46, "Tax Lens: Estimated Tax Receipt")
+    pdf.setFont("Helvetica", 9)
+    pdf.drawString(margin, height - 64, "Educational estimate for 2025 federal tax rules - not a tax return or filing advice")
+
+    cursor -= 62
+    pdf.setFillColor(colors.HexColor("#113B5C"))
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.drawString(margin, cursor, "Profile snapshot")
+    cursor -= 16
+    pdf.setFillColor(colors.black)
+    pdf.setFont("Helvetica", 9.5)
+    profile_line = (
+        f"{FILING_LABELS[profile.filing_status]} | {profile.state} | "
+        f"W-2 wages: {_money(profile.salary)} | Dependents: {profile.dependents}"
     )
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="ReceiptTitle", parent=styles["Title"], textColor=colors.HexColor("#12372b"), alignment=TA_CENTER, fontSize=21, leading=23, spaceAfter=2))
-    styles.add(ParagraphStyle(name="Subtitle", parent=styles["BodyText"], textColor=colors.HexColor("#56635d"), alignment=TA_CENTER, fontSize=9, leading=11))
-    styles.add(ParagraphStyle(name="Section", parent=styles["Heading2"], textColor=colors.HexColor("#12372b"), fontSize=10.5, leading=12, spaceBefore=5, spaceAfter=3))
-    styles.add(ParagraphStyle(name="Fine", parent=styles["BodyText"], textColor=colors.HexColor("#56635d"), fontSize=7.2, leading=8.5))
+    pdf.drawString(margin, cursor, profile_line)
 
-    story = [
-        Paragraph("Tax Lens", styles["ReceiptTitle"]),
-        Paragraph("Educational 2025 tax estimate and spending context", styles["Subtitle"]),
-        Spacer(1, 7),
+    cursor -= 30
+    pdf.setFillColor(colors.HexColor("#113B5C"))
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.drawString(margin, cursor, "Estimated tax summary")
+    cursor -= 18
+
+    summary = [
+        ("Federal income tax", result.federal_income_tax),
+        ("Social Security and Medicare", result.payroll_tax),
+        ("State income-tax proxy", result.state_income_tax_proxy),
+        ("Total estimated tax", result.total_estimated_tax),
+        ("Estimated take-home after tax", result.take_home_after_estimated_tax),
     ]
+    col_width = (width - 2 * margin) / 2
+    for index, (label, value) in enumerate(summary):
+        col = index % 2
+        row = index // 2
+        x = margin + col * col_width
+        y = cursor - row * 24
+        if index == 4:
+            x = margin
+            y = cursor - 2 * 24
+        pdf.setFillColor(colors.HexColor("#4E6E81"))
+        pdf.setFont("Helvetica", 8.5)
+        pdf.drawString(x, y, label)
+        pdf.setFillColor(colors.black)
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(x, y - 11, _money(value))
 
-    summary_data = [
-        ["Household profile", f"{filing_status} · {state}"],
-        ["Gross household income", _money(result["gross_income"])],
-        ["Federal taxable income", _money(result["taxable_income"])],
-        ["Estimated total tax", _money(result["total_tax"])],
-        ["Estimated take-home", _money(result["take_home"])],
-        ["Effective tax rate", f"{result['effective_rate']:.1%}"],
+    cursor -= 103
+    pdf.setFillColor(colors.HexColor("#113B5C"))
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.drawString(margin, cursor, "Illustrative allocation of estimated federal income tax")
+    cursor -= 13
+    pdf.setFillColor(colors.HexColor("#4E6E81"))
+    pdf.setFont("Helvetica", 8)
+    pdf.drawString(
+        margin,
+        cursor,
+        "This proportional model does not trace any taxpayer's payment to an agency or program.",
+    )
+    cursor -= 16
+
+    rows = list(allocations)[:7]
+    row_height = 17
+    table_width = width - 2 * margin
+    pdf.setFillColor(colors.HexColor("#EAF0F4"))
+    pdf.rect(margin, cursor - 14, table_width, 15, fill=1, stroke=0)
+    pdf.setFillColor(colors.HexColor("#113B5C"))
+    pdf.setFont("Helvetica-Bold", 8.5)
+    pdf.drawString(margin + 6, cursor - 10, "Policy area")
+    pdf.drawRightString(width - margin - 6, cursor - 10, "Illustrative amount")
+    cursor -= 15
+    for index, row in enumerate(rows):
+        if index % 2 == 1:
+            pdf.setFillColor(colors.HexColor("#F6F8FA"))
+            pdf.rect(margin, cursor - 14, table_width, 15, fill=1, stroke=0)
+        pdf.setFillColor(colors.black)
+        pdf.setFont("Helvetica", 8.5)
+        label = _truncate(str(row["category"]), table_width - 150, "Helvetica", 8.5)
+        pdf.drawString(margin + 6, cursor - 10, label)
+        pdf.drawRightString(width - margin - 6, cursor - 10, _money(float(row["amount"])))
+        cursor -= row_height
+
+    cursor -= 9
+    pdf.setFillColor(colors.HexColor("#113B5C"))
+    pdf.setFont("Helvetica-Bold", 10)
+    pdf.drawString(margin, cursor, "Important limitations")
+    cursor -= 14
+    pdf.setFillColor(colors.HexColor("#4E6E81"))
+    pdf.setFont("Helvetica", 7.7)
+    lines = [
+        "Federal estimates simplify credits, deductions, and special situations. State figures are wage-income proxies.",
+        "Budget categories are a dated FY2024 model. Appropriations, obligations, and outlays are different stages.",
+        "See the app's Sources & Method tab before relying on this receipt for decisions.",
     ]
-    summary = Table(summary_data, colWidths=[2.35 * inch, 4.25 * inch])
-    summary.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f3efe5")),
-        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#56635d")),
-        ("TEXTCOLOR", (1, 0), (1, -1), colors.HexColor("#12372b")),
-        ("FONTNAME", (1, 0), (1, -1), "Helvetica-Bold"),
-        ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#d9d3c5")),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    story.extend([summary, Paragraph("Estimated tax breakdown", styles["Section"])])
+    for line in lines:
+        pdf.drawString(margin, cursor, line)
+        cursor -= 11
 
-    tax_rows = [["Federal income", _money(result["federal_income_tax"])], ["Social Security", _money(result["social_security"])], ["Medicare", _money(result["medicare"])], ["State income (rough)", _money(result["state_income_tax"])]]
-    taxes = Table(tax_rows, colWidths=[3.3 * inch, 3.3 * inch])
-    taxes.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), .25, colors.HexColor("#ded9cd")), ("ALIGN", (1, 0), (1, -1), "RIGHT"), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
-    story.extend([taxes, Paragraph("Illustrative federal spending allocation", styles["Section"])])
-
-    spending = sorted(allocate_federal_income_tax(result["federal_income_tax"]), key=lambda row: row[1], reverse=True)[:8]
-    spending_rows = [[category, _money(amount)] for category, amount in spending]
-    spending_table = Table(spending_rows, colWidths=[4.5 * inch, 2.1 * inch])
-    spending_table.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), .2, colors.HexColor("#e2ddd2")), ("ALIGN", (1, 0), (1, -1), "RIGHT"), ("FONTSIZE", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
-    story.extend([spending_table, Paragraph("Largest agency-scale allocations", styles["Section"])])
-
-    agencies = sorted(allocate_by_agency(result["federal_income_tax"]), key=lambda row: row[1], reverse=True)[:6]
-    agency_rows = [[agency, _money(amount)] for agency, amount in agencies]
-    agency_table = Table(agency_rows, colWidths=[4.5 * inch, 2.1 * inch])
-    agency_table.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), .2, colors.HexColor("#e2ddd2")), ("ALIGN", (1, 0), (1, -1), "RIGHT"), ("FONTSIZE", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
-    story.extend([
-        agency_table,
-        Spacer(1, 5),
-        Paragraph("Federal dollars are pooled. Spending and agency figures apply broad FY2024 outlay shares to estimated federal income tax; they are not traceable personal contributions. State tax is a coarse proxy. This receipt excludes many tax provisions and is not tax, legal, or financial advice.", styles["Fine"]),
-        Spacer(1, 4),
-        Paragraph("Federal assumptions: IRS 2025 brackets, standard deductions, payroll rules, and Child Tax Credit guidance. Spending context: CBO and U.S. Treasury FY2024.", styles["Fine"]),
-    ])
-    doc.build(story)
+    pdf.setStrokeColor(colors.HexColor("#D9E2E9"))
+    pdf.line(margin, 34, width - margin, 34)
+    pdf.setFillColor(colors.HexColor("#617789"))
+    pdf.setFont("Helvetica", 7.5)
+    pdf.drawString(margin, 22, "Tax Lens educational estimator | Generated locally in your browser session")
+    pdf.drawRightString(width - margin, 22, "Tax year 2025")
+    pdf.save()
     return buffer.getvalue()
